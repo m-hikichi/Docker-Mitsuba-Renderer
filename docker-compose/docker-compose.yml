@@ -5,7 +5,7 @@ services:
     build:
       context: ../Dockerfile
       dockerfile: Dockerfile
-    image: mitsuba
+    image: mitsuba3:v3.7.0-gpu
     container_name: mitsuba
     volumes:
       - ../src:/workspace/src
