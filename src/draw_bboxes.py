@@ -5,20 +5,24 @@
 draw_bboxes.py
 
 export_visible_bboxes.py が出力した JSON を読み込み、画像に bbox を描画して保存する。
+- 同じ label 文字列の bbox は同じ色で枠線を描画する
+- 異なる label の bbox は異なる色で枠線を描画する
+  ※ 色は決定論的に割り当てる（同じ label は常に同じ色）
 
 レイヤリング（重要）:
-- 大きい床 bbox の「塗り」が小物の「枠線」を消さないように、
-  2パス描画を採用する:
+- 大きい床 bbox の「塗り」が小物の「枠線」を消さないように、2パス描画:
   1) fill（塗り）を先に全部描く
-  2) outline（枠線）を「遠い→近い」の順で描く（近いほど最後に描かれて上に来る）
+  2) outline（枠線）を「遠い→近い」の順で描く（近いほど最後＝上に来る）
 
 拡張ポイント:
-- 色を shape_id/shape_index で変える
+- color_for_key() を差し替える（固定パレット等）
 - 並べ替えキーを変更（depth_min/mean/hits 等）
 - ラベル内容の拡張
 """
 
 import argparse
+import colorsys
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -301,6 +305,62 @@ def make_label(ann: Dict[str, Any], mode: str) -> str:
     return sid or sidx
 
 
+def color_for_key(key: str, cache: Dict[str, Tuple[int, int, int]]) -> Tuple[int, int, int]:
+    """
+    key（通常は label 文字列）から決定論的に RGB 色を生成する。
+
+    同じ key は常に同じ色になり、異なる key は基本的に異なる色になる。
+    実装は SHA1 ハッシュ → HSV 色相へ割当 → RGB 変換。
+
+    Args:
+        key: 色を決めるキー（例: label 文字列）
+        cache: 計算結果キャッシュ（同キーの再計算を避ける）
+
+    Returns:
+        (r, g, b) 各 0..255
+    """
+    if key in cache:
+        return cache[key]
+
+    k = key if key else "__empty__"
+    digest = hashlib.sha1(k.encode("utf-8")).digest()
+
+    # hue を 0..1 に割当（上位16bit使用）
+    hue = int.from_bytes(digest[0:2], "big") / 65535.0
+
+    # 彩度・明度は固定（視認性を確保）
+    sat = 0.70
+    val = 0.95
+
+    r_f, g_f, b_f = colorsys.hsv_to_rgb(hue, sat, val)
+    rgb = (int(r_f * 255), int(g_f * 255), int(b_f * 255))
+    cache[key] = rgb
+    return rgb
+
+
+def color_key_for_annotation(ann: Dict[str, Any], label_text: str) -> str:
+    """
+    どの文字列を「同一判定（=同色）」のキーにするかを決める。
+
+    原則: 表示ラベル文字列をキーにする。
+    label が 'none' で label_text が空の場合でも、shape_id/shape_index からキーを作る。
+
+    Args:
+        ann: annotation
+        label_text: make_label() の結果（空の可能性あり）
+
+    Returns:
+        str: 色決定キー
+    """
+    if label_text:
+        return label_text
+    # label を描かない場合でも、shapeごとに色分けしたいので fallback
+    sid = ann.get("shape_id", None)
+    if sid is not None and str(sid) != "":
+        return str(sid)
+    return str(ann.get("shape_index", "__unknown__"))
+
+
 def transform_bbox(ann: Dict[str, Any], sx: float, sy: float, W: int, H: int) -> Tuple[int, int, int, int]:
     """
     JSON の bbox を入力画像座標へ変換する（スケール補正 + クリップ）。
@@ -327,8 +387,9 @@ def main() -> None:
 
     - JSON を読み込み
     - 必要なら bbox 座標をスケール補正
-    - 枠線を「遠い→近い」で描画して “手前ほど上” を実現
-    - 塗り→枠線の2パスで、床 bbox が小物の枠線を消すのを回避
+    - 2パス（塗り→枠線）で描画
+    - 枠線は「遠い→近い」で描画して “手前ほど上” を実現
+    - 枠線色は label 文字列から決定論的に割り当てる
     """
     args = parse_args()
 
@@ -354,33 +415,41 @@ def main() -> None:
         tie_breaker=str(args.tie_breaker)
     )
 
-    # ---- Pass 1: Fill ----
+    # ラベル→色のキャッシュ
+    color_cache: Dict[str, Tuple[int, int, int]] = {}
+
+    # ---- Pass 1: Fill（必要なら） ----
     fill_alpha = max(0, min(int(args.fill_alpha), 255))
     if fill_alpha > 0:
-        fill_rgba = (255, 0, 0, fill_alpha)
         for ann in sorted_for_outline:
+            label_text = make_label(ann, str(args.label))
+            key = color_key_for_annotation(ann, label_text)
+            r, g, b = color_for_key(key, color_cache)
+
             bbox = transform_bbox(ann, sx, sy, W, H)
-            draw.rectangle(list(bbox), fill=fill_rgba)
+            draw.rectangle(list(bbox), fill=(r, g, b, fill_alpha))
 
     # ---- Pass 2: Outline + Label ----
-    outline_rgba = (255, 0, 0, 220)
     thickness = max(1, int(args.thickness))
 
     for ann in sorted_for_outline:
-        bbox = transform_bbox(ann, sx, sy, W, H)
-        draw_rect_thick(draw, bbox, outline_rgba, thickness)
+        label_text = make_label(ann, str(args.label))
+        key = color_key_for_annotation(ann, label_text)
+        r, g, b = color_for_key(key, color_cache)
 
-        label = make_label(ann, str(args.label))
-        if label:
+        bbox = transform_bbox(ann, sx, sy, W, H)
+        draw_rect_thick(draw, bbox, (r, g, b, 220), thickness)
+
+        if label_text:
             pad = 3
-            tw, th = text_size(draw, label, font)
+            tw, th = text_size(draw, label_text, font)
             xmin, ymin, _, _ = bbox
 
             tx = xmin
             ty = max(0, ymin - (th + pad * 2 + 2))
             bg = (0, 0, 0, 160)
             draw.rectangle([tx, ty, tx + tw + pad * 2, ty + th + pad * 2], fill=bg)
-            draw.text((tx + pad, ty + pad), label, font=font, fill=(255, 255, 255, 230))
+            draw.text((tx + pad, ty + pad), label_text, font=font, fill=(255, 255, 255, 230))
 
     out = Image.alpha_composite(img, overlay).convert("RGB")
     out_path.parent.mkdir(parents=True, exist_ok=True)
